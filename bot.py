@@ -12,7 +12,7 @@ import certifi
 import json
 import itertools
 import openpyxl
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import urllib3
 
 # ── Termux / Android SSL fix ──────────────────────────────
@@ -33,6 +33,18 @@ _apihelper.SESSION = _tg_session
 BOT_TOKEN = '8649575787:AAFgM8Eb5dVaumlTNTMzYxtu1eY3sN4YfkQ'
 ADMIN_IDS = set([8671204957])  # Add admin Telegram user IDs here, e.g. set([123456789])
 
+DEFAULT_SERVER = 'limited.facebook.com'
+DEFAULT_DEVICE = 'Random'
+DEFAULT_BROWSER = 'Chrome'
+DEFAULT_THREADS = 100
+MAX_THREAD_LIMIT = 300
+PROGRESS_UPDATE_INTERVAL = 3
+REQUEST_TIMEOUT = 15
+CONNECT_TIMEOUT = 8
+MAX_RETRIES = 2
+MIN_JITTER = 0.02
+MAX_JITTER = 0.08
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
 def is_admin(uid):
@@ -47,25 +59,36 @@ def is_admin(uid):
 sessions = {}
 session_lock = threading.Lock()
 
+
+def create_default_session():
+    return {
+        'server': DEFAULT_SERVER,
+        'device': DEFAULT_DEVICE,
+        'browser': DEFAULT_BROWSER,
+        'threads': DEFAULT_THREADS,
+        'proxy_list': [],
+        'numbers': [],
+        'running': False,
+        'stop_flag': False,
+        'stats': {'checked': 0, 'found': 0, 'not_found': 0, 'error': 0},
+        'progress_msg_id': None,
+        'found_numbers': [],
+        'not_found_numbers': [],
+        'error_numbers': [],
+        'awaiting': None,
+        'last_progress_text': None,
+        'last_progress_update': 0,
+        'result_details': {},
+        'start_ts': None,
+        'active_workers': 0,
+        'current_locale': 'en_US',
+    }
+
+
 def get_session(cid):
     with session_lock:
         if cid not in sessions:
-            sessions[cid] = {
-                'server': 'limited.facebook.com',
-                'device': 'Random',
-                'browser': 'Chrome',
-                'threads': 100,
-                'proxy_list': [],
-                'numbers': [],
-                'running': False,
-                'stop_flag': False,
-                'stats': {'checked': 0, 'found': 0, 'not_found': 0, 'error': 0},
-                'progress_msg_id': None,
-                'found_numbers': [],
-                'not_found_numbers': [],
-                'error_numbers': [],
-                'awaiting': None,
-            }
+            sessions[cid] = create_default_session()
         return sessions[cid]
 
 # ============================================================
@@ -79,7 +102,7 @@ SERVER_MAP = {
     '5': 'm.alpha.facebook.com',
     '6': 'm.beta.facebook.com',
     '7': 'x.facebook.com',
-    '8': 'limited.facebook.com',
+    '8': DEFAULT_SERVER,
     '0': 'Random',
 }
 
@@ -139,8 +162,26 @@ COUNTRY_TO_LOCALE = {
     'ZM': 'en_US', 'ZW': 'en_US',
 }
 
+
 def get_locale_code(cc):
-    return COUNTRY_TO_LOCALE.get(cc.upper(), 'en_US')
+    return COUNTRY_TO_LOCALE.get((cc or 'US').upper(), 'en_US')
+
+
+def clamp_threads(value, has_proxies=False):
+    if has_proxies:
+        return max(1, min(value, MAX_THREAD_LIMIT))
+    return max(1, min(value, 100))
+
+
+def normalize_numbers(raw_numbers):
+    seen = set()
+    cleaned = []
+    for raw in raw_numbers:
+        s = re.sub(r'[^0-9]', '', str(raw).strip())
+        if 7 <= len(s) <= 15 and s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+    return cleaned
 
 # ============================================================
 # PROXY & IP HELPERS
@@ -148,23 +189,26 @@ def get_locale_code(cc):
 free_proxies_cache = []
 proxy_cache_lock = threading.Lock()
 
+
 def fetch_new_ip():
     global free_proxies_cache
     with proxy_cache_lock:
         if not free_proxies_cache:
             try:
                 r = requests.get(
-                    'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all',
-                    timeout=10
+                    'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes&anonymity=all',
+                    timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+                    verify=False,
                 )
                 free_proxies_cache = [p.strip() for p in r.text.strip().split('\n') if p.strip()]
                 random.shuffle(free_proxies_cache)
-            except:
+            except Exception:
                 pass
         if free_proxies_cache:
             px = free_proxies_cache.pop(0)
             return {'http': f'http://{px}', 'https': f'http://{px}'}
     return None
+
 
 def parse_proxy(proxy_str):
     if not proxy_str:
@@ -193,16 +237,28 @@ def parse_proxy(proxy_str):
         proxy_url = proxy_str
     return {'http': proxy_url, 'https': proxy_url}
 
-def test_proxy(proxies, domain='limited.facebook.com'):
+
+def test_proxy(proxies, domain=DEFAULT_SERVER):
     try:
-        r = requests.get(f'https://{domain}', proxies=proxies, timeout=10)
+        r = requests.get(
+            f'https://{domain}',
+            proxies=proxies,
+            timeout=(5, 8),
+            verify=False,
+        )
         return r.status_code == 200
-    except:
+    except Exception:
         return False
+
 
 def get_ip_info(proxies=None):
     try:
-        r = requests.get('http://ip-api.com/json/', proxies=proxies, timeout=10)
+        r = requests.get(
+            'http://ip-api.com/json/',
+            proxies=proxies,
+            timeout=(4, 6),
+            verify=False,
+        )
         if r.status_code == 200:
             d = r.json()
             return {
@@ -210,57 +266,37 @@ def get_ip_info(proxies=None):
                 'countryCode': d.get('countryCode', 'US'),
                 'timezone': d.get('timezone', 'Unknown'),
             }
-    except:
+    except Exception:
         pass
     return {'country': 'Unknown', 'countryCode': 'US', 'timezone': 'Unknown'}
 
 # ============================================================
 # CORE: FACEBOOK CHECKER
 # ============================================================
-def process_sms(session, resp_text, number, url, base_headers, server_domain, sms_proxy_iterator=None, device_type='Android'):
-    if 'id="contact_point_selector_form"' in resp_text and 'name="recover_method"' in resp_text:
-        sms_options = re.findall(
-            'input type="radio" name="recover_method" value="(send_sms:.*?)".*?id="(.*?)"', resp_text
-        )
-        if sms_options:
-            return True
-        else:
-            return True
-    return False
-
-def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count=0,
-          server_domain='limited.facebook.com', sms_proxy_iterator=None, device_type='Random'):
-    if server_domain == 'Random':
-        server_domain = random.choice(list(v for k, v in SERVER_MAP.items() if v != 'Random'))
-
-    session = requests.Session()
-    session.timeout = 30
-    if proxy:
-        session.proxies.update(proxy)
-
+def build_headers(locale='en_US', device_type='Random'):
     if device_type == 'Random':
         device_type = random.choice(['Android', 'iPhone'])
 
     if device_type == 'Android':
         andro_ver = random.choice(['10', '11', '12', '13', '14'])
         model = random.choice(['SM-G998B', 'SM-S908B', 'Pixel 6', 'Pixel 7', 'M2101K6G'])
-        chrome_ver = random.randint(90, 122)
+        chrome_ver = random.randint(110, 126)
         ua = f'Mozilla/5.0 (Linux; Android {andro_ver}; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Mobile Safari/537.36'
     elif device_type == 'iPhone':
         ios_ver = random.choice(['15_6_1', '16_0', '16_2', '16_5', '17_0', '17_1'])
         ios_main = ios_ver.split('_')[0]
         ua = f'Mozilla/5.0 (iPhone; CPU iPhone OS {ios_ver} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ios_main}.0 Mobile/15E148 Safari/604.1'
     elif device_type == 'KaiOS':
-        ua = f'Mozilla/5.0 (Mobile; Nokia; rv:48.0) Gecko/48.0 Firefox/48.0 KaiOS/{random.choice(["2.5","3.0","3.1"])}'
+        ua = f'Mozilla/5.0 (Mobile; Nokia; rv:48.0) Gecko/48.0 Firefox/48.0 KaiOS/{random.choice(["2.5", "3.0", "3.1"])}'
     elif device_type == 'Windows Phone':
-        ua = f'Mozilla/5.0 (Windows Phone 10.0; Android 7.0; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Mobile Safari/537.36 Edge/15.15063'
+        ua = 'Mozilla/5.0 (Windows Phone 10.0; Android 7.0; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Mobile Safari/537.36 Edge/15.15063'
     elif device_type == 'BlackBerry':
-        ua = f'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.0.1337 Mobile Safari/537.10+'
+        ua = 'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.0.1337 Mobile Safari/537.10+'
     else:
         model = random.choice(['SM-G998B', 'Pixel 6', 'M2101K6G'])
-        ua = f'Mozilla/5.0 (Linux; Android 12; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90,120)}.0.0.0 Mobile Safari/537.36'
+        ua = f'Mozilla/5.0 (Linux; Android 12; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(110,126)}.0.0.0 Mobile Safari/537.36'
 
-    base_headers = {
+    return {
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'accept-language': f'{locale},en;q=0.9',
         'user-agent': ua,
@@ -272,35 +308,61 @@ def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count
         'cache-control': 'max-age=0',
     }
 
+
+def process_sms(resp_text):
+    if 'id="contact_point_selector_form"' in resp_text and 'name="recover_method"' in resp_text:
+        return True
+    return False
+
+
+def create_http_session(proxy=None):
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({'Connection': 'keep-alive'})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    if proxy:
+        session.proxies.update(proxy)
+    return session
+
+
+def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count=0,
+          server_domain=DEFAULT_SERVER, sms_proxy_iterator=None, device_type='Random'):
+    if server_domain == 'Random':
+        server_domain = random.choice([v for v in SERVER_MAP.values() if v != 'Random'])
+
+    session = create_http_session(proxy=proxy)
+    base_headers = build_headers(locale=locale, device_type=device_type)
+
     try:
         git_fb = session.get(
             f'https://{server_domain}/login/identify/?ctx=recover&ars=facebook_login&from_login_screen=0&__mmr=1&_rdr',
-            headers=base_headers, timeout=30
+            headers=base_headers,
+            timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
         )
         try:
             lsd = re.search('name="lsd" value="(.*?)"', git_fb.text).group(1)
-        except:
+        except Exception:
             try:
                 lsd = re.search(r'\["LSD",\[\],\{"token":"(.*?)"\}', git_fb.text).group(1)
-            except:
+            except Exception:
                 lsd = ''
         try:
             jazoest = re.search('name="jazoest" value="(.*?)"', git_fb.text).group(1)
-        except:
+        except Exception:
             try:
                 jazoest = re.search('"initSprinkleValue":"(.*?)"', git_fb.text).group(1)
-            except:
+            except Exception:
                 jazoest = ''
 
         if not lsd or not jazoest:
-            if retry_count < 3:
-                new_proxy = fetch_new_ip()
-                time.sleep(random.uniform(0.3, 0.8))
+            if retry_count < MAX_RETRIES:
+                new_proxy = fetch_new_ip() if proxy else None
+                time.sleep(random.uniform(MIN_JITTER, MAX_JITTER))
                 return check(number, new_proxy or proxy, locale, browser_type, retry_count + 1, server_domain, sms_proxy_iterator, device_type)
-            else:
-                return 'error', 'IP Rate Limited'
+            return 'error', 'IP Rate Limited'
 
-        time.sleep(random.uniform(0.1, 0.3))
         _data = {'lsd': lsd, 'jazoest': jazoest, 'email': number, 'did_submit': 'Search'}
         post_headers = base_headers.copy()
         post_headers.update({
@@ -310,14 +372,20 @@ def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count
             'sec-fetch-site': 'same-origin',
         })
         url = f'https://{server_domain}/login/identify/?ctx=recover&c=%2Flogin%2F&search_attempts=1&ars=facebook_login&alternate_search=0'
-        resp = session.post(url, data=_data, headers=post_headers, allow_redirects=True, timeout=30)
+        resp = session.post(
+            url,
+            data=_data,
+            headers=post_headers,
+            allow_redirects=True,
+            timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+        )
 
         if 'id="login_identify_search_error_msg"' in resp.text:
             err_match = re.search('id="login_identify_search_error_msg"[^>]*>(.*?)</div>', resp.text, re.IGNORECASE | re.DOTALL)
             err_text = err_match.group(1).lower() if err_match else ''
             if any(k in err_text for k in ['temporarily blocked', 'try again', 'too many', 'limit', 'spam', 'unusual', 'restrict']):
-                if retry_count < 3:
-                    new_proxy = fetch_new_ip()
+                if retry_count < MAX_RETRIES:
+                    new_proxy = fetch_new_ip() if proxy else None
                     return check(number, new_proxy or proxy, locale, browser_type, retry_count + 1, server_domain, sms_proxy_iterator, device_type)
                 return 'error', 'Soft Ban'
             return 'not_found', 'Account Not Found'
@@ -326,20 +394,21 @@ def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count
             return 'found', 'Multiple Accounts Found'
 
         if resp.url.startswith(f'https://{server_domain}/login/account_recovery/name_search/'):
-            resp2 = session.get(resp.url, headers=base_headers, timeout=30)
+            resp2 = session.get(resp.url, headers=base_headers, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
             if 'action="/login/account_recovery/name_search/?flow=initiate_view' in resp2.text:
                 resp3 = session.get(
                     f'https://{server_domain}/recover/initiate/?c=%2Flogin%2F&fl=initiate_view&ctx=msite_initiate_view',
-                    headers=base_headers, timeout=30
+                    headers=base_headers,
+                    timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
                 )
-                if process_sms(session, resp3.text, number, resp3.url, base_headers, server_domain, sms_proxy_iterator, device_type):
+                if process_sms(resp3.text):
                     return 'found', 'Account Found (SMS Option)'
                 return 'found', 'Account Found (Other Option)'
 
         if resp.url.startswith(f'https://{server_domain}/login/device-based/ar/login/?ldata='):
-            resp2 = session.get(resp.url, headers=base_headers, timeout=30)
+            resp2 = session.get(resp.url, headers=base_headers, timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
             if 'id="contact_point_selector_form"' in resp2.text:
-                if process_sms(session, resp2.text, number, resp2.url, base_headers, server_domain, sms_proxy_iterator, device_type):
+                if process_sms(resp2.text):
                     return 'found', 'Account Found (SMS Option)'
                 return 'found', 'Account Found (Contact Point)'
             if 'name="captcha_response"' in resp2.text:
@@ -349,115 +418,152 @@ def check(number, proxy=None, locale='en_US', browser_type='Chrome', retry_count
             return 'error', 'Unknown Page'
 
         if 'window.MPageLoadClientMetrics' in resp.text:
-            if retry_count < 3:
-                new_proxy = fetch_new_ip()
+            if retry_count < MAX_RETRIES:
+                new_proxy = fetch_new_ip() if proxy else None
                 return check(number, new_proxy or proxy, locale, browser_type, retry_count + 1, server_domain, sms_proxy_iterator, device_type)
             return 'error', 'Bot Block'
 
         return 'error', 'Unknown Response'
 
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-        if retry_count < 3:
-            time.sleep(2)
-            new_proxy = fetch_new_ip()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        if retry_count < MAX_RETRIES:
+            new_proxy = fetch_new_ip() if proxy else None
             return check(number, new_proxy or proxy, locale, browser_type, retry_count + 1, server_domain, sms_proxy_iterator, device_type)
         return 'error', 'Network Error'
     except Exception as e:
-        return 'error', str(e)[:50]
+        return 'error', str(e)[:80]
+    finally:
+        session.close()
 
 # ============================================================
 # EXTRACT NUMBERS FROM EXCEL
 # ============================================================
 def extract_numbers_from_excel(path):
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
         sheet = wb.active
         target_col = None
         max_matches = 0
+        sample_limit = min(25, sheet.max_row or 0)
         for col_idx in range(1, sheet.max_column + 1):
             match_count = 0
-            for row_idx in range(2, min(22, sheet.max_row + 1)):
+            for row_idx in range(2, sample_limit + 1):
                 val = sheet.cell(row=row_idx, column=col_idx).value
                 if val:
-                    s = re.sub(r'[\s\-\(\)\+]', '', str(val).strip())
-                    if s.isdigit() and 7 <= len(s) <= 15:
+                    s = re.sub(r'[^0-9]', '', str(val).strip())
+                    if 7 <= len(s) <= 15:
                         match_count += 1
             if match_count > max_matches:
                 max_matches = match_count
                 target_col = col_idx
         if not target_col:
             return None, 'No phone column found'
+
         numbers = []
         for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row, min_col=target_col, max_col=target_col, values_only=True):
             val = row[0]
             if val:
-                s = re.sub(r'[\s\-\(\)\+]', '', str(val).strip())
-                if s.isdigit() and 7 <= len(s) <= 15:
+                s = re.sub(r'[^0-9]', '', str(val).strip())
+                if 7 <= len(s) <= 15:
                     numbers.append(s)
-        return numbers, None
+        wb.close()
+        return normalize_numbers(numbers), None
     except Exception as e:
         return None, str(e)
 
 # ============================================================
 # BACKGROUND CHECKER THREAD
 # ============================================================
-def safe_send(chat_id, text, reply_markup=None, retries=5):
-    """Send message with auto-retry on network errors."""
+def safe_send(chat_id, text, reply_markup=None, retries=4):
     for attempt in range(retries):
         try:
             return bot.send_message(chat_id, text, reply_markup=reply_markup)
         except Exception as e:
             if attempt < retries - 1:
-                time.sleep(3 * (attempt + 1))
+                time.sleep(1.5 * (attempt + 1))
             else:
                 print(f"safe_send failed after {retries} attempts: {e}")
     return None
 
-def safe_edit(chat_id, msg_id, text, reply_markup=None, retries=3):
-    """Edit message with auto-retry on network errors."""
+
+def safe_edit(chat_id, msg_id, text, reply_markup=None, retries=2):
     for attempt in range(retries):
         try:
             bot.edit_message_text(text, chat_id, msg_id, reply_markup=reply_markup)
             return True
         except Exception as e:
-            err = str(e)
-            # Message not modified is not a real error
-            if 'message is not modified' in err.lower():
+            err = str(e).lower()
+            if 'message is not modified' in err:
                 return True
             if attempt < retries - 1:
-                time.sleep(2)
+                time.sleep(1)
     return False
+
+
+def format_elapsed(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f'{h}h {m}m {s}s'
+    if m:
+        return f'{m}m {s}s'
+    return f'{s}s'
+
 
 def run_checker(cid, chat_id):
     s = get_session(cid)
-    numbers = s['numbers']
+    numbers = list(s['numbers'])
     server = s['server']
     device = s['device']
-    browser = s['browser']
-    threads = s['threads']
-    proxies = s['proxy_list']
+    threads = clamp_threads(s['threads'], has_proxies=bool(s['proxy_list']))
+    proxies = list(s['proxy_list'])
 
-    s['stats'] = {'checked': 0, 'found': 0, 'not_found': 0, 'error': 0}
-    s['found_numbers'] = []
-    s['not_found_numbers'] = []
-    s['error_numbers'] = []
+    with session_lock:
+        s['threads'] = threads
+        s['stats'] = {'checked': 0, 'found': 0, 'not_found': 0, 'error': 0}
+        s['found_numbers'] = []
+        s['not_found_numbers'] = []
+        s['error_numbers'] = []
+        s['result_details'] = {}
+        s['last_progress_text'] = None
+        s['last_progress_update'] = 0
+        s['start_ts'] = time.time()
+        s['active_workers'] = 0
 
-    proxy_iter = itertools.cycle(proxies) if proxies else None
-
-    try:
-        ip_info = get_ip_info(proxies[0] if proxies else None)
-        locale = get_locale_code(ip_info['countryCode'])
-    except:
-        locale = 'en_US'
+    locale = 'en_US'
+    if proxies:
+        try:
+            ip_info = get_ip_info(proxies[0])
+            locale = get_locale_code(ip_info.get('countryCode'))
+        except Exception:
+            locale = 'en_US'
+    with session_lock:
+        s['current_locale'] = locale
 
     total = len(numbers)
-    last_update_time = time.time()
 
-    def send_progress_update():
-        st = s['stats']
+    def send_progress_update(force=False):
+        with session_lock:
+            st = dict(s['stats'])
+            running = s['running']
+            progress_msg_id = s['progress_msg_id']
+            last_progress_text = s.get('last_progress_text')
+            last_progress_update = s.get('last_progress_update', 0)
+            active_workers = s.get('active_workers', 0)
+            started = s.get('start_ts') or time.time()
+
+        now = time.time()
+        if not force and now - last_progress_update < PROGRESS_UPDATE_INTERVAL:
+            return
+
         pct = int((st['checked'] / total) * 100) if total > 0 else 0
         filled = int(pct / 5)
         bar = '█' * filled + '░' * (20 - filled)
+        elapsed = now - started
+        speed = (st['checked'] / elapsed) if elapsed > 0 else 0
+        eta = int((total - st['checked']) / speed) if speed > 0 and st['checked'] < total else 0
+
         text = (
             f"⚡ <b>Checking in Progress...</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -466,50 +572,74 @@ def run_checker(cid, chat_id):
             f"✅ Found    : <code>{st['found']}</code>\n"
             f"❌ Not Found: <code>{st['not_found']}</code>\n"
             f"⚠️ Error    : <code>{st['error']}</code>\n"
+            f"⚙️ Workers  : <code>{active_workers}/{threads}</code>\n"
+            f"🚀 Speed    : <code>{speed:.2f}/sec</code>\n"
+            f"⏱ Elapsed  : <code>{format_elapsed(elapsed)}</code>\n"
+            f"🕒 ETA      : <code>{format_elapsed(eta) if eta else '0s'}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🌐 Server   : <code>{server}</code>\n"
             f"📱 Device   : <code>{device}</code>\n"
             f"🔑 Proxies  : <code>{len(proxies)}</code>"
         )
+
+        if not force and text == last_progress_text:
+            with session_lock:
+                s['last_progress_update'] = now
+            return
+
         stop_mk = InlineKeyboardMarkup()
-        stop_mk.add(InlineKeyboardButton("🛑 Stop Checking", callback_data="stop_check"))
-        if s['progress_msg_id']:
-            ok = safe_edit(chat_id, s['progress_msg_id'], text, stop_mk)
-            if not ok:
-                msg = safe_send(chat_id, text, stop_mk)
-                if msg:
-                    s['progress_msg_id'] = msg.message_id
-        else:
+        if running:
+            stop_mk.add(InlineKeyboardButton("🛑 Stop Checking", callback_data="stop_check"))
+
+        ok = False
+        if progress_msg_id:
+            ok = safe_edit(chat_id, progress_msg_id, text, stop_mk)
+        if not ok:
             msg = safe_send(chat_id, text, stop_mk)
             if msg:
-                s['progress_msg_id'] = msg.message_id
+                with session_lock:
+                    s['progress_msg_id'] = msg.message_id
+        with session_lock:
+            s['last_progress_text'] = text
+            s['last_progress_update'] = now
 
-    # Send initial status message (with retry)
     init_msg = safe_send(
         chat_id,
         f"🚀 <b>Starting FB Checker...</b>\n"
         f"📋 Numbers: <code>{total}</code>\n"
         f"🌐 Server : <code>{server}</code>\n"
         f"📱 Device : <code>{device}</code>\n"
-        f"🔢 Threads: <code>{threads}</code>"
+        f"🔢 Threads: <code>{threads}</code>\n"
+        f"🔄 Refresh: <code>{PROGRESS_UPDATE_INTERVAL}s</code>"
     )
     if init_msg:
-        s['progress_msg_id'] = init_msg.message_id
+        with session_lock:
+            s['progress_msg_id'] = init_msg.message_id
+
+    send_progress_update(force=True)
 
     def worker(number):
-        if s['stop_flag']:
-            return
-        proxy = next(proxy_iter) if proxy_iter else None
+        with session_lock:
+            if s['stop_flag']:
+                return
+            s['active_workers'] += 1
+
+        proxy = random.choice(proxies) if proxies else None
         try:
             result, msg_txt = check(
-                number, proxy=proxy, locale=locale,
-                server_domain=server, device_type=device
+                number,
+                proxy=proxy,
+                locale=locale,
+                server_domain=server,
+                device_type=device,
             )
         except Exception as e:
-            result, msg_txt = 'error', str(e)[:30]
+            result, msg_txt = 'error', str(e)[:50]
 
         with session_lock:
+            s['active_workers'] -= 1
             s['stats']['checked'] += 1
+            s['result_details'][number] = msg_txt
             if result == 'found':
                 s['stats']['found'] += 1
                 s['found_numbers'].append(number)
@@ -520,33 +650,53 @@ def run_checker(cid, chat_id):
                 s['stats']['error'] += 1
                 s['error_numbers'].append(number)
 
-    send_progress_update()
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(worker, num): num for num in numbers}
-        for i, future in enumerate(as_completed(futures)):
-            if s['stop_flag']:
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            now = time.time()
-            if now - last_update_time >= 15 or (i + 1) % 100 == 0:
-                send_progress_update()
-                last_update_time = now
-
-    s['running'] = False
-    s['stop_flag'] = False
-
-    # Save result files
+    futures = set()
     try:
-        with open(f'found_{cid}.txt', 'w') as f:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            num_iter = iter(numbers)
+
+            while True:
+                with session_lock:
+                    should_stop = s['stop_flag']
+
+                while not should_stop and len(futures) < threads:
+                    try:
+                        number = next(num_iter)
+                    except StopIteration:
+                        break
+                    futures.add(executor.submit(worker, number))
+
+                if not futures:
+                    break
+
+                done, futures = wait(futures, timeout=PROGRESS_UPDATE_INTERVAL, return_when=FIRST_COMPLETED)
+                send_progress_update(force=True)
+
+                if should_stop:
+                    for future in futures:
+                        future.cancel()
+                    break
+    finally:
+        with session_lock:
+            s['running'] = False
+            s['stop_flag'] = False
+            s['active_workers'] = 0
+
+    try:
+        with open(f'found_{cid}.txt', 'w', encoding='utf-8') as f:
             f.write('\n'.join(s['found_numbers']))
-        with open(f'not_found_{cid}.txt', 'w') as f:
+        with open(f'not_found_{cid}.txt', 'w', encoding='utf-8') as f:
             f.write('\n'.join(s['not_found_numbers']))
-    except:
+        with open(f'error_{cid}.txt', 'w', encoding='utf-8') as f:
+            lines = [f"{num} | {s['result_details'].get(num, 'Unknown Error')}" for num in s['error_numbers']]
+            f.write('\n'.join(lines))
+    except Exception:
         pass
 
     st = s['stats']
     pct = int((st['checked'] / total) * 100) if total > 0 else 0
+    elapsed = time.time() - (s.get('start_ts') or time.time())
+    speed = (st['checked'] / elapsed) if elapsed > 0 else 0
     summary = (
         f"✅ <b>Checking Complete!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -555,6 +705,8 @@ def run_checker(cid, chat_id):
         f"✅ Found    : <code>{st['found']}</code>\n"
         f"❌ Not Found: <code>{st['not_found']}</code>\n"
         f"⚠️ Error    : <code>{st['error']}</code>\n"
+        f"🚀 Avg Speed: <code>{speed:.2f}/sec</code>\n"
+        f"⏱ Time     : <code>{format_elapsed(elapsed)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     result_mk = InlineKeyboardMarkup(row_width=2)
@@ -562,6 +714,8 @@ def run_checker(cid, chat_id):
         InlineKeyboardButton("📥 Download Found", callback_data="dl_found"),
         InlineKeyboardButton("📥 Download Not Found", callback_data="dl_not_found"),
     )
+    if s['error_numbers']:
+        result_mk.add(InlineKeyboardButton("📥 Download Errors", callback_data="dl_error"))
     result_mk.add(InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
 
     if s['progress_msg_id']:
@@ -586,8 +740,10 @@ def main_menu_text(cid):
         f"🌍 Browser : <code>{s['browser']}</code>\n"
         f"🔢 Threads : <code>{s['threads']}</code>\n"
         f"🔑 Proxies : <code>{len(s['proxy_list'])}</code>\n"
+        f"🔄 Refresh : <code>{PROGRESS_UPDATE_INTERVAL}s</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+
 
 def main_menu_markup(cid):
     s = get_session(cid)
@@ -603,6 +759,7 @@ def main_menu_markup(cid):
     if s['running']:
         mk.add(InlineKeyboardButton("🛑 Stop Checking", callback_data="stop_check"))
     return mk
+
 
 def settings_markup():
     mk = InlineKeyboardMarkup(row_width=2)
@@ -622,6 +779,7 @@ def settings_markup():
     mk.add(InlineKeyboardButton("🏠 Back to Menu", callback_data="main_menu"))
     return mk
 
+
 def server_markup():
     mk = InlineKeyboardMarkup(row_width=2)
     for k, v in SERVER_MAP.items():
@@ -629,6 +787,7 @@ def server_markup():
         mk.add(InlineKeyboardButton(label, callback_data=f"sv_{k}"))
     mk.add(InlineKeyboardButton("🔙 Back", callback_data="settings"))
     return mk
+
 
 def device_markup():
     mk = InlineKeyboardMarkup(row_width=2)
@@ -638,6 +797,7 @@ def device_markup():
         mk.add(InlineKeyboardButton(label, callback_data=f"dv_{k}"))
     mk.add(InlineKeyboardButton("🔙 Back", callback_data="settings"))
     return mk
+
 
 def browser_markup():
     mk = InlineKeyboardMarkup(row_width=3)
@@ -664,6 +824,7 @@ def cmd_myid(message):
         f"<code>ADMIN_IDS = set([{uid}])</code>"
     )
 
+
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     if not is_admin(message.from_user.id):
@@ -672,6 +833,7 @@ def cmd_start(message):
     cid = message.chat.id
     get_session(cid)
     bot.send_message(cid, main_menu_text(cid), reply_markup=main_menu_markup(cid))
+
 
 @bot.message_handler(content_types=['document'])
 def handle_file(message):
@@ -685,7 +847,7 @@ def handle_file(message):
 
     s['awaiting'] = None
     doc = message.document
-    fname = doc.file_name or ''
+    fname = (doc.file_name or '').lower()
 
     try:
         file_info = bot.get_file(doc.file_id)
@@ -706,7 +868,7 @@ def handle_file(message):
     elif fname.endswith('.txt'):
         try:
             content = downloaded.decode('utf-8', errors='ignore')
-            numbers = [ln.strip() for ln in content.splitlines() if ln.strip()]
+            numbers = normalize_numbers(content.splitlines())
         except Exception as e:
             bot.send_message(cid, f"❌ Text file parse error: {e}")
             return
@@ -722,12 +884,13 @@ def handle_file(message):
     bot.send_message(
         cid,
         f"✅ <b>File loaded!</b>\n"
-        f"📋 Numbers found: <code>{len(numbers)}</code>\n\n"
+        f"📋 Unique valid numbers: <code>{len(numbers)}</code>\n\n"
         f"Ready to start. Use the button below.",
         reply_markup=InlineKeyboardMarkup().add(
             InlineKeyboardButton("🚀 Start Now!", callback_data="begin_check")
         )
     )
+
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
@@ -735,7 +898,7 @@ def handle_text(message):
         return
     cid = message.chat.id
     s = get_session(cid)
-    text = message.text.strip()
+    text = (message.text or '').strip()
 
     if s.get('awaiting') == 'threads':
         s['awaiting'] = None
@@ -744,48 +907,60 @@ def handle_text(message):
             if not (1 <= t <= 2000):
                 raise ValueError
             s['threads'] = t
-            bot.send_message(cid, f"✅ Threads set to <code>{t}</code>", reply_markup=settings_markup())
-        except:
+            actual = clamp_threads(t, has_proxies=bool(s['proxy_list']))
+            note = '' if actual == t else f"\n⚠️ Runtime cap applied: <code>{actual}</code> for stability"
+            bot.send_message(cid, f"✅ Threads set to <code>{t}</code>{note}", reply_markup=settings_markup())
+        except Exception:
             bot.send_message(cid, "❌ Invalid! Enter a number between 1–2000.", reply_markup=settings_markup())
 
     elif s.get('awaiting') == 'proxy':
         s['awaiting'] = None
         proxies_added = 0
-        lines = text.strip().splitlines()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         wait_msg = bot.send_message(cid, f"⏳ Testing {len(lines)} proxy/proxies...")
+        tested = []
         for line in lines:
-            line = line.strip()
-            if not line:
-                continue
             parsed = parse_proxy(line)
-            if parsed:
+            if parsed and parsed not in tested:
+                tested.append(parsed)
                 if test_proxy(parsed, s['server']):
                     s['proxy_list'].append(parsed)
                     proxies_added += 1
+        # de-duplicate stored proxies
+        unique = []
+        seen = set()
+        for px in s['proxy_list']:
+            key = px.get('http')
+            if key not in seen:
+                seen.add(key)
+                unique.append(px)
+        s['proxy_list'] = unique
         try:
             bot.edit_message_text(
                 f"✅ <b>{proxies_added}/{len(lines)}</b> proxies added and working!\n"
                 f"🔑 Total proxies: <code>{len(s['proxy_list'])}</code>",
-                cid, wait_msg.message_id,
+                cid,
+                wait_msg.message_id,
                 reply_markup=settings_markup()
             )
-        except:
+        except Exception:
             bot.send_message(cid, f"✅ {proxies_added} proxies added.", reply_markup=settings_markup())
 
     elif s.get('awaiting') == 'numbers_text':
         s['awaiting'] = None
-        nums = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        nums = normalize_numbers(text.splitlines())
         if nums:
             s['numbers'] = nums
             bot.send_message(
                 cid,
-                f"✅ <b>{len(nums)} numbers loaded!</b>",
+                f"✅ <b>{len(nums)} unique valid numbers loaded!</b>",
                 reply_markup=InlineKeyboardMarkup().add(
                     InlineKeyboardButton("🚀 Start Now!", callback_data="begin_check")
                 )
             )
         else:
             bot.send_message(cid, "⚠️ No valid numbers found.")
+
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -799,15 +974,14 @@ def handle_callback(call):
 
     bot.answer_callback_query(call.id)
 
-    # ── MAIN MENU ──
     if data == 'main_menu':
         try:
             bot.edit_message_text(main_menu_text(cid), cid, mid, reply_markup=main_menu_markup(cid))
-        except:
+        except Exception:
             bot.send_message(cid, main_menu_text(cid), reply_markup=main_menu_markup(cid))
 
-    # ── SETTINGS ──
     elif data == 'settings':
+        actual_threads = clamp_threads(s['threads'], has_proxies=bool(s['proxy_list']))
         s_txt = (
             f"⚙️ <b>Settings</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -815,37 +989,36 @@ def handle_callback(call):
             f"📱 Device  : <code>{s['device']}</code>\n"
             f"🌍 Browser : <code>{s['browser']}</code>\n"
             f"🔢 Threads : <code>{s['threads']}</code>\n"
+            f"⚡ Runtime  : <code>{actual_threads}</code>\n"
             f"🔑 Proxies : <code>{len(s['proxy_list'])}</code>"
         )
         try:
             bot.edit_message_text(s_txt, cid, mid, reply_markup=settings_markup())
-        except:
+        except Exception:
             bot.send_message(cid, s_txt, reply_markup=settings_markup())
 
-    # ── SET SERVER ──
     elif data == 'set_server':
         try:
             bot.edit_message_text("🌐 <b>Select Server:</b>", cid, mid, reply_markup=server_markup())
-        except:
+        except Exception:
             bot.send_message(cid, "🌐 <b>Select Server:</b>", reply_markup=server_markup())
 
     elif data.startswith('sv_'):
         key = data[3:]
-        s['server'] = SERVER_MAP.get(key, 'limited.facebook.com')
+        s['server'] = SERVER_MAP.get(key, DEFAULT_SERVER)
         bot.answer_callback_query(call.id, f"✅ Server: {s['server']}", show_alert=True)
         try:
             bot.edit_message_text(
                 f"⚙️ <b>Settings</b>\n🌐 Server: <code>{s['server']}</code>",
                 cid, mid, reply_markup=settings_markup()
             )
-        except:
+        except Exception:
             bot.send_message(cid, f"✅ Server set to <code>{s['server']}</code>", reply_markup=settings_markup())
 
-    # ── SET DEVICE ──
     elif data == 'set_device':
         try:
             bot.edit_message_text("📱 <b>Select Device:</b>", cid, mid, reply_markup=device_markup())
-        except:
+        except Exception:
             bot.send_message(cid, "📱 <b>Select Device:</b>", reply_markup=device_markup())
 
     elif data.startswith('dv_'):
@@ -857,14 +1030,13 @@ def handle_callback(call):
                 f"⚙️ <b>Settings</b>\n📱 Device: <code>{s['device']}</code>",
                 cid, mid, reply_markup=settings_markup()
             )
-        except:
+        except Exception:
             bot.send_message(cid, f"✅ Device set to <code>{s['device']}</code>", reply_markup=settings_markup())
 
-    # ── SET BROWSER ──
     elif data == 'set_browser':
         try:
             bot.edit_message_text("🌍 <b>Select Browser:</b>", cid, mid, reply_markup=browser_markup())
-        except:
+        except Exception:
             bot.send_message(cid, "🌍 <b>Select Browser:</b>", reply_markup=browser_markup())
 
     elif data.startswith('br_'):
@@ -876,22 +1048,18 @@ def handle_callback(call):
                 f"⚙️ <b>Settings</b>\n🌍 Browser: <code>{s['browser']}</code>",
                 cid, mid, reply_markup=settings_markup()
             )
-        except:
+        except Exception:
             bot.send_message(cid, f"✅ Browser set to <code>{s['browser']}</code>", reply_markup=settings_markup())
 
-    # ── SET THREADS ──
     elif data == 'set_threads':
         mk_t = InlineKeyboardMarkup(row_width=3)
         mk_t.add(
-            InlineKeyboardButton("⚡ 50",   callback_data="th_50"),
-            InlineKeyboardButton("🚀 100",  callback_data="th_100"),
-            InlineKeyboardButton("💥 200",  callback_data="th_200"),
-            InlineKeyboardButton("🔥 300",  callback_data="th_300"),
-            InlineKeyboardButton("🌪 500",  callback_data="th_500"),
-            InlineKeyboardButton("💣 750",  callback_data="th_750"),
-            InlineKeyboardButton("🚀 1000", callback_data="th_1000"),
-            InlineKeyboardButton("⚡ 1500", callback_data="th_1500"),
-            InlineKeyboardButton("🔥 2000", callback_data="th_2000"),
+            InlineKeyboardButton("⚡ 25", callback_data="th_25"),
+            InlineKeyboardButton("⚡ 50", callback_data="th_50"),
+            InlineKeyboardButton("🚀 100", callback_data="th_100"),
+            InlineKeyboardButton("💥 150", callback_data="th_150"),
+            InlineKeyboardButton("🔥 200", callback_data="th_200"),
+            InlineKeyboardButton("🌪 300", callback_data="th_300"),
         )
         mk_t.add(InlineKeyboardButton("✏️ Custom (type)", callback_data="th_custom"))
         mk_t.add(InlineKeyboardButton("🔙 Back", callback_data="settings"))
@@ -899,15 +1067,16 @@ def handle_callback(call):
             f"🔢 <b>Set Thread Count</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Current : <code>{s['threads']}</code>\n"
+            f"Runtime : <code>{clamp_threads(s['threads'], has_proxies=bool(s['proxy_list']))}</code>\n"
             f"Range   : 1 – 2000\n\n"
             f"📌 <b>Recommended:</b>\n"
-            f"• No Proxy      → 50–100\n"
-            f"• With Proxy    → 300–500\n"
-            f"• Many Proxies  → 1000–2000"
+            f"• No Proxy      → 25–100\n"
+            f"• With Proxy    → 100–300\n"
+            f"• Refresh Rate  → every {PROGRESS_UPDATE_INTERVAL}s"
         )
         try:
             bot.edit_message_text(txt, cid, mid, reply_markup=mk_t)
-        except:
+        except Exception:
             bot.send_message(cid, txt, reply_markup=mk_t)
 
     elif data.startswith('th_'):
@@ -919,21 +1088,24 @@ def handle_callback(call):
                     f"✏️ <b>Custom Thread Count</b>\n\nCurrent: <code>{s['threads']}</code>\nRange: 1–2000\n\nSend the number:",
                     cid, mid
                 )
-            except:
+            except Exception:
                 bot.send_message(cid, "✏️ Send thread count (1–2000):")
         else:
             t = int(key)
             s['threads'] = t
-            bot.answer_callback_query(call.id, f"✅ Threads set to {t}", show_alert=True)
+            actual = clamp_threads(t, has_proxies=bool(s['proxy_list']))
+            msg = f"✅ Threads set to {t}"
+            if actual != t:
+                msg += f"\nRuntime cap: {actual}"
+            bot.answer_callback_query(call.id, msg, show_alert=True)
             try:
                 bot.edit_message_text(
-                    f"⚙️ <b>Settings</b>\n🔢 Threads: <code>{t}</code>",
+                    f"⚙️ <b>Settings</b>\n🔢 Threads: <code>{t}</code>\n⚡ Runtime: <code>{actual}</code>",
                     cid, mid, reply_markup=settings_markup()
                 )
-            except:
-                bot.send_message(cid, f"✅ Threads set to <code>{t}</code>", reply_markup=settings_markup())
+            except Exception:
+                bot.send_message(cid, f"✅ Threads set to <code>{t}</code>\n⚡ Runtime: <code>{actual}</code>", reply_markup=settings_markup())
 
-    # ── PROXY ──
     elif data == 'set_proxy':
         s['awaiting'] = 'proxy'
         try:
@@ -945,7 +1117,7 @@ def handle_callback(call):
                 "<code>http://user:pass@ip:port</code>",
                 cid, mid
             )
-        except:
+        except Exception:
             bot.send_message(
                 cid,
                 "✏️ Send proxy/proxies (one per line):\n"
@@ -960,51 +1132,37 @@ def handle_callback(call):
                 "⚙️ <b>Settings</b>\n🔑 Proxies: <code>0</code> (cleared)",
                 cid, mid, reply_markup=settings_markup()
             )
-        except:
+        except Exception:
             bot.send_message(cid, "✅ Proxies cleared.", reply_markup=settings_markup())
 
-    # ── RESET CONFIG ──
     elif data == 'reset_config':
         mk_confirm = InlineKeyboardMarkup(row_width=2)
         mk_confirm.add(
             InlineKeyboardButton("✅ Yes, Reset", callback_data="reset_confirm"),
-            InlineKeyboardButton("❌ Cancel",     callback_data="settings"),
+            InlineKeyboardButton("❌ Cancel", callback_data="settings"),
         )
         try:
             bot.edit_message_text(
                 "⚠️ <b>Reset All Settings?</b>\n\n"
                 "This will reset:\n"
-                "• Server → limited.facebook.com\n"
-                "• Device → Random\n"
-                "• Browser → Chrome\n"
-                "• Threads → 100\n"
+                f"• Server → {DEFAULT_SERVER}\n"
+                f"• Device → {DEFAULT_DEVICE}\n"
+                f"• Browser → {DEFAULT_BROWSER}\n"
+                f"• Threads → {DEFAULT_THREADS}\n"
                 "• Proxy → Clear all\n\n"
                 "Numbers list will NOT be cleared.",
                 cid, mid, reply_markup=mk_confirm
             )
-        except:
+        except Exception:
             bot.send_message(cid, "⚠️ Confirm reset?", reply_markup=mk_confirm)
 
     elif data == 'reset_confirm':
         if s['running']:
             bot.answer_callback_query(call.id, "⚠️ Stop checking first!", show_alert=True)
             return
-        sessions[cid] = {
-            'server': 'limited.facebook.com',
-            'device': 'Random',
-            'browser': 'Chrome',
-            'threads': 100,
-            'proxy_list': [],
-            'numbers': s.get('numbers', []),
-            'running': False,
-            'stop_flag': False,
-            'stats': {'checked': 0, 'found': 0, 'not_found': 0, 'error': 0},
-            'progress_msg_id': None,
-            'found_numbers': [],
-            'not_found_numbers': [],
-            'error_numbers': [],
-            'awaiting': None,
-        }
+        numbers_keep = s.get('numbers', [])
+        sessions[cid] = create_default_session()
+        sessions[cid]['numbers'] = numbers_keep
         bot.answer_callback_query(call.id, "✅ All settings reset to default!", show_alert=True)
         s2 = get_session(cid)
         s_txt = (
@@ -1018,10 +1176,9 @@ def handle_callback(call):
         )
         try:
             bot.edit_message_text(s_txt, cid, mid, reply_markup=settings_markup())
-        except:
+        except Exception:
             bot.send_message(cid, s_txt, reply_markup=settings_markup())
 
-    # ── START CHECK ──
     elif data == 'start_check':
         if s['running']:
             bot.answer_callback_query(call.id, "⚠️ Already running! Stop first.", show_alert=True)
@@ -1036,7 +1193,7 @@ def handle_callback(call):
         mk.add(InlineKeyboardButton("🔙 Back", callback_data="main_menu"))
         try:
             bot.edit_message_text("📂 <b>How to load numbers?</b>", cid, mid, reply_markup=mk)
-        except:
+        except Exception:
             bot.send_message(cid, "📂 <b>How to load numbers?</b>", reply_markup=mk)
 
     elif data == 'upload_file':
@@ -1046,7 +1203,7 @@ def handle_callback(call):
                 "📤 <b>Send your file</b>\n\nSupported: <b>.txt</b> (one number per line) or <b>.xlsx</b>",
                 cid, mid
             )
-        except:
+        except Exception:
             bot.send_message(cid, "📤 Send your .txt or .xlsx file now:")
 
     elif data == 'paste_numbers':
@@ -1056,7 +1213,7 @@ def handle_callback(call):
                 "✏️ <b>Paste numbers</b>\n\nSend numbers, one per line:\n<code>9920000001\n9920000002\n...</code>",
                 cid, mid
             )
-        except:
+        except Exception:
             bot.send_message(cid, "✏️ Send numbers, one per line:")
 
     elif data == 'begin_check':
@@ -1066,13 +1223,13 @@ def handle_callback(call):
         if not s.get('numbers'):
             bot.answer_callback_query(call.id, "❌ No numbers loaded! Upload a file first.", show_alert=True)
             return
+        s['numbers'] = normalize_numbers(s['numbers'])
         s['running'] = True
         s['stop_flag'] = False
         s['progress_msg_id'] = None
         t = threading.Thread(target=run_checker, args=(cid, cid), daemon=True)
         t.start()
 
-    # ── STOP ──
     elif data == 'stop_check':
         if s['running']:
             s['stop_flag'] = True
@@ -1082,17 +1239,18 @@ def handle_callback(call):
                     "⏹ <b>Stopping...</b>\nWaiting for current checks to finish.",
                     cid, mid
                 )
-            except:
+            except Exception:
                 bot.send_message(cid, "⏹ Stopping...")
         else:
             bot.answer_callback_query(call.id, "ℹ️ Nothing is running.", show_alert=True)
 
-    # ── LIVE STATS ──
     elif data == 'live_stats':
         st = s['stats']
         total = len(s['numbers']) if s['numbers'] else 0
         pct = int((st['checked'] / total) * 100) if total > 0 else 0
         status_txt = "🟢 Running" if s['running'] else "🔴 Idle"
+        elapsed = time.time() - (s.get('start_ts') or time.time()) if s['running'] else 0
+        speed = (st['checked'] / elapsed) if elapsed > 0 else 0
         stats_text = (
             f"📊 <b>Live Stats</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1102,6 +1260,8 @@ def handle_callback(call):
             f"✅ Found     : <code>{st['found']}</code>\n"
             f"❌ Not Found : <code>{st['not_found']}</code>\n"
             f"⚠️ Error     : <code>{st['error']}</code>\n"
+            f"🚀 Speed     : <code>{speed:.2f}/sec</code>\n"
+            f"⏱ Elapsed   : <code>{format_elapsed(elapsed)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
         )
         mk = InlineKeyboardMarkup(row_width=2)
@@ -1111,16 +1271,17 @@ def handle_callback(call):
         )
         try:
             bot.edit_message_text(stats_text, cid, mid, reply_markup=mk)
-        except:
+        except Exception:
             bot.send_message(cid, stats_text, reply_markup=mk)
 
-    # ── DOWNLOAD RESULTS ──
     elif data == 'download_results':
         found_path = f'found_{cid}.txt'
         nf_path = f'not_found_{cid}.txt'
+        err_path = f'error_{cid}.txt'
         has_found = os.path.exists(found_path) and os.path.getsize(found_path) > 0
         has_nf = os.path.exists(nf_path) and os.path.getsize(nf_path) > 0
-        if not has_found and not has_nf:
+        has_err = os.path.exists(err_path) and os.path.getsize(err_path) > 0
+        if not has_found and not has_nf and not has_err:
             bot.answer_callback_query(call.id, "ℹ️ No results yet. Run a check first.", show_alert=True)
             return
         mk = InlineKeyboardMarkup(row_width=2)
@@ -1128,10 +1289,12 @@ def handle_callback(call):
             mk.add(InlineKeyboardButton(f"✅ Found ({len(s['found_numbers'])})", callback_data="dl_found"))
         if has_nf:
             mk.add(InlineKeyboardButton(f"❌ Not Found ({len(s['not_found_numbers'])})", callback_data="dl_not_found"))
+        if has_err:
+            mk.add(InlineKeyboardButton(f"⚠️ Errors ({len(s['error_numbers'])})", callback_data="dl_error"))
         mk.add(InlineKeyboardButton("🏠 Menu", callback_data="main_menu"))
         try:
             bot.edit_message_text("📁 <b>Download Results:</b>", cid, mid, reply_markup=mk)
-        except:
+        except Exception:
             bot.send_message(cid, "📁 <b>Download Results:</b>", reply_markup=mk)
 
     elif data == 'dl_found':
@@ -1150,20 +1313,28 @@ def handle_callback(call):
         else:
             bot.answer_callback_query(call.id, "ℹ️ No not-found numbers yet.", show_alert=True)
 
+    elif data == 'dl_error':
+        path = f'error_{cid}.txt'
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, 'rb') as f:
+                bot.send_document(cid, f, caption=f"⚠️ Errors: <code>{len(s['error_numbers'])}</code> numbers")
+        else:
+            bot.answer_callback_query(call.id, "ℹ️ No error results yet.", show_alert=True)
+
 # ============================================================
 # RUN
 # ============================================================
 if __name__ == '__main__':
-    print("=" * 45)
-    print("  ✅  FB Checker Bot is running!")
-    print("  📌  /start  — Main menu")
-    print("  📌  /myid   — Get your Telegram user ID")
+    print('=' * 45)
+    print('  ✅  FB Checker Bot is running!')
+    print('  📌  /start  — Main menu')
+    print('  📌  /myid   — Get your Telegram user ID')
     if not ADMIN_IDS:
-        print("  ⚠️   ADMIN_IDS is empty — all users have access!")
-        print("       Send /myid to bot, then set your ID.")
+        print('  ⚠️   ADMIN_IDS is empty — all users have access!')
+        print('       Send /myid to bot, then set your ID.')
     else:
-        print(f"  🔐  Admins: {ADMIN_IDS}")
-    print("=" * 45)
+        print(f'  🔐  Admins: {ADMIN_IDS}')
+    print('=' * 45)
 
     while True:
         try:
@@ -1174,5 +1345,5 @@ if __name__ == '__main__':
                 skip_pending=True,
             )
         except Exception as e:
-            print(f"⚠️ Polling error: {e} — restarting in 5s...")
+            print(f'⚠️ Polling error: {e} — restarting in 5s...')
             time.sleep(5)
